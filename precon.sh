@@ -3,6 +3,16 @@
 
 set -euo pipefail
 
+# === COLORS ===
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+# ========================================
+
 # Auto-detect and install proxychains if missing (Termux-friendly)
 if [[ "$*" == *"--stealth"* ]] && ! command -v proxychains >/dev/null; then
     echo -e "${YELLOW}[!] proxychains not found, installing...${NC}"
@@ -15,15 +25,6 @@ OUTPUT_DIR=""
 MODE="demo" # demo | full | stealth
 MAX_SAVE=200
 START_TIME=$(date +%s)
-
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m'
 
 # Logging functions
 log() { echo -e "${BLUE}[*] $1${NC}"; }
