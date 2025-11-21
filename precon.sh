@@ -3,6 +3,12 @@
 
 set -euo pipefail
 
+# Auto-detect and install proxychains if missing (Termux-friendly)
+if [[ "$*" == *"--stealth"* ]] && ! command -v proxychains >/dev/null; then
+    echo -e "${YELLOW}[!] proxychains not found, installing...${NC}"
+    pkg update -y && pkg install -y proxychains-ng
+fi
+
 VERSION="1.0-merged"
 TARGET=""
 OUTPUT_DIR=""
@@ -59,37 +65,30 @@ check_tool() {
 passive_subs() {
     log "Phase 1: Discovering subdomains for $TARGET"
     mkdir -p "$OUTPUT_DIR/subs"
+    local ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-    # 1. crt.sh (SSL certificate transparency logs)
-    log "Querying crt.sh..."
-    curl -s "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null | \
-        jq -r '.[].name_value' 2>/dev/null | \
-        sort -u > "$OUTPUT_DIR/subs/crtsh.txt" || true
+    # 1. crt.sh
+    curl -sA "$ua" "https://crt.sh/?q=%25.$TARGET&output=json" | jq -r '.[].name_value' 2>/dev/null | sort -u > "$OUTPUT_DIR/subs/crtsh.txt"
 
-    # 2. AlienVault OTX
-    log "Querying AlienVault OTX..."
-    curl -s "https://otx.alienvault.com/api/v1/domains/$TARGET/subdomains?limit=500" 2>/dev/null | \
-        jq -r '.data[].hostname' 2>/dev/null > "$OUTPUT_DIR/subs/otx.txt" || true
+    # 2. HackerTarget
+    curl -sA "$ua" "https://api.hackertarget.com/hostsearch/?q=$TARGET" | cut -d',' -f1 | grep -v "error" > "$OUTPUT_DIR/subs/hackertarget.txt" 2>/dev/null || true
 
-    # 3. DNS bufferover
-    log "Querying dns.bufferover.run..."
-    curl -s "https://dns.bufferover.run/dns?q=$TARGET" 2>/dev/null | \
-        jq -r '.FDNS_A[],.FDNS_CNAME[]' 2>/dev/null | \
-        cut -d',' -f2 | sort -u > "$OUTPUT_DIR/subs/bufferover.txt" || true
+    # 3. RapidDNS
+    curl -sA "$ua" "https://rapiddns.io/subdomain/$TARGET?full=1#result" | grep -oE "[a-zA-Z0-9._-]+\.$TARGET" | sort -u > "$OUTPUT_DIR/subs/rapiddns.txt" 2>/dev/null || true
 
-    # 4. Amass passive mode (if available)
+    # 4. Anubis (jldc.me)
+    curl -sA "$ua" "https://jldc.me/anubis/subdomains/$TARGET" | jq -r '.[]?' 2>/dev/null > "$OUTPUT_DIR/subs/anubis.txt" || true
+
+    # 5. Amass passive (still great)
     if command -v amass >/dev/null; then
-        log "Running Amass passive enumeration (180s timeout)..."
-        timeout 180 amass enum -passive -d "$TARGET" -o "$OUTPUT_DIR/subs/amass.txt" 2>/dev/null || true
+        timeout 300 amass enum -passive -d "$TARGET" -o "$OUTPUT_DIR/subs/amass.txt" 2>/dev/null || true
     fi
 
-    # Combine and deduplicate
-    cat "$OUTPUT_DIR/subs/"*.txt 2>/dev/null | \
-        sort -u | \
-        grep -E "\.$TARGET\$" > "$OUTPUT_DIR/subdomains.txt" || true
-   
-    local sub_count=$(wc -l < "$OUTPUT_DIR/subdomains.txt" 2>/dev/null || echo 0)
-    success "Discovered $sub_count unique subdomains"
+    # Combine & clean
+    cat "$OUTPUT_DIR/subs/"*.txt 2>/dev/null | grep -v '^$' | sort -u | grep -E "\.$TARGET$" > "$OUTPUT_DIR/subdomains.txt"
+    
+    local count=$(wc -l < "$OUTPUT_DIR/subdomains.txt" 2>/dev/null || echo 0)
+    success "Discovered $count unique subdomains"
 }
 
 # === PHASE 2: LIVE HOST VALIDATION ===
@@ -126,9 +125,9 @@ validate_live_hosts() {
     # Ping function
     check_host() {
         local h="$1"
-        if ping -c 1 -W 2 "$h" >/dev/null 2>&1; then
-            echo "$h" >> "$live_tmp"
-        fi
+        for port in 80 443 8080 8443; do
+            timeout 3 bash -c "exec 3<>/dev/tcp/$h/$port && echo $h" 2>/dev/null && echo "$h" >> "$live_tmp" && return
+        done
     }
     export -f check_host
     export live_tmp
@@ -305,16 +304,52 @@ while [[ $# -gt 0 ]]; do
         -h|--help) show_help; exit 0;;
         --full) MODE="full"; shift;;
         --stealth)
+            MODE="stealth"
+            log "Stealth mode enabled — forcing ALL traffic through Tor"
+
+            # 1. Force curl through Tor (DNS + traffic)
             export HTTPS_PROXY=socks5h://127.0.0.1:9050
-            log "Stealth mode enabled via Tor"
-            shift;;
-        *)
-            if [[ -z "$TARGET" ]]; then
-                TARGET="$1"
-            elif [[ "$1" =~ ^[0-9]+$ ]]; then
-                MAX_SAVE="$1"
+            export HTTP_PROXY=socks5h://127.0.0.1:9050
+
+            # 2. Wrapper for any tool that ignores proxies
+            proxy_wrap() {
+                proxychains -q "$@"
+            }
+
+            # 3. Check if proxychains + tor is actually running
+            if ! pgrep tor >/dev/null; then
+                error "Tor is not running! Start it with: tor"
+                exit 1
             fi
-            shift;;
+            if ! command -v proxychains >/dev/null; then
+                error "proxychains not installed! Install with: pkg install proxychains-ng"
+                exit 1
+            fi
+
+            # 4. Override dangerous functions
+            amass()    { proxy_wrap amass "$@"; }
+            httpx()    { proxy_wrap httpx -http-proxy socks5://127.0.0.1:9050 "$@"; }
+            gau()      { proxy_wrap gau "$@"; }
+            katana()   { proxy_wrap katana -proxy socks5://127.0.0.1:9050 "$@"; }
+            nuclei()   { proxy_wrap nuclei -proxy socks5://127.0.0.1:9050 "$@"; }
+
+            # 5. Slower but safer live check via Tor (curl HEAD)
+            check_host() {
+                local h="$1"
+                for port in 80 443; do
+                    timeout 15 curl -sI -x socks5h://127.0.0.1:9050 "http://$h:$port" -m 10 >/dev/null 2>&1 && \
+                        echo "$h" && return
+                    timeout 15 curl -sI -x socks5h://127.0.0.1:9050 "https://$h:$port" -k -m 10 >/dev/null 2>&1 && \
+                        echo "$h" && return
+                done
+            }
+            export -f check_host
+
+            # 6. Add delay to avoid rate limiting + Tor circuit burnout
+            export CONCURRENCY=8
+            log "Reduced concurrency to $CONCURRENCY to protect Tor circuits"
+            shift
+            ;;
     esac
 done
 
