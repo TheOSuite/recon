@@ -161,7 +161,7 @@ validate_live_hosts() {
     
     # Auto-detect Android/Termux environment
     if [[ "$TCP_VALIDATE" == false ]]; then
-        if [[ -d "/data/data/com.termux" ]] || [[ "$PREFIX" == *"com.termux"* ]]; then
+        if [[ -d "/data/data/com.termux" ]] || [[ "${PREFIX:-}" == *"com.termux"* ]]; then
             warn "Android/Termux detected - switching to TCP validation mode"
             TCP_VALIDATE=true
         fi
@@ -281,25 +281,23 @@ resolve_dns() {
     local total=$(wc -l < "$INPUT")
     local current=0
     
-    # Temporary file for IP mapping
+    # Temp file for IP mapping
     local ip_map_tmp=$(mktemp)
     trap 'rm -f "$ip_map_tmp"' RETURN
     
-    info "Resolving DNS for $total hosts..."
+    info "Resolving DNS for $total hosts (parallel, fast provider detection)..."
     
-    while IFS= read -r host; do
-        ((current++))
-        printf "\r${CYAN}Progress: ${WHITE}%d/%d${NC}" "$current" "$total"
+    # Parallel DNS resolution (batch 20 at a time, timeout 3s each)
+    resolve_batch() {
+        local host="$1"
+        # Use Google DNS for speed and reliability
+        local ips=$(timeout 3 dig +short @8.8.8.8 A "$host" 2>/dev/null | grep -E '^[0-9]+\.' || true)
         
-        # Get A records
-        local ips=$(dig +short A "$host" 2>/dev/null | grep -E '^[0-9]+\.')
-        
-        # Get CNAME if no A record
         if [[ -z "$ips" ]]; then
-            local cname=$(dig +short CNAME "$host" 2>/dev/null | head -1)
+            local cname=$(timeout 3 dig +short @8.8.8.8 CNAME "$host" 2>/dev/null | head -1 || true)
             if [[ -n "$cname" ]]; then
                 echo "$host -> CNAME: $cname" >> "$DNS_OUTPUT"
-                ips=$(dig +short A "$cname" 2>/dev/null | grep -E '^[0-9]+\.')
+                ips=$(timeout 3 dig +short @8.8.8.8 A "$cname" 2>/dev/null | grep -E '^[0-9]+\.' || true)
             fi
         fi
         
@@ -308,28 +306,87 @@ resolve_dns() {
                 echo "$host -> $ip" >> "$DNS_OUTPUT"
                 echo "$ip|$host" >> "$ip_map_tmp"
                 
-                # Detect cloud provider
+                # Fast provider detection via IP ranges (instant vs slow whois)
                 local provider="Unknown"
-                local org=$(whois "$ip" 2>/dev/null | grep -i "OrgName\|Organization" | head -1 | cut -d: -f2 | xargs || echo "Unknown")
+                local org="Unknown"
                 
-                case "$org" in
-                    *Amazon*|*AWS*) provider="AWS" ;;
-                    *Google*|*GCP*) provider="Google Cloud" ;;
-                    *Microsoft*|*Azure*) provider="Azure" ;;
-                    *Cloudflare*) provider="Cloudflare" ;;
-                    *DigitalOcean*) provider="DigitalOcean" ;;
-                    *Akamai*) provider="Akamai" ;;
-                esac
+                # AWS ranges (most common)
+                if [[ $ip =~ ^(3\.|13\.|18\.|52\.|54\.|99\.|107\.|176\.|184\.) ]]; then
+                    provider="AWS"
+                    org="Amazon Web Services"
+                # Google Cloud
+                elif [[ $ip =~ ^(34\.|35\.|104\.|130\.|146\.|162\.) ]]; then
+                    provider="Google Cloud"
+                    org="Google LLC"
+                # Azure
+                elif [[ $ip =~ ^(13\.|20\.|23\.|40\.|51\.|52\.|104\.|137\.|138\.|168\.) ]]; then
+                    provider="Azure"
+                    org="Microsoft Corporation"
+                # Cloudflare
+                elif [[ $ip =~ ^(104\.1[6-9]\.|104\.2[0-9]\.|104\.3[0-1]\.|172\.6[4-7]\.|173\.245\.|188\.114\.) ]]; then
+                    provider="Cloudflare"
+                    org="Cloudflare Inc"
+                # DigitalOcean
+                elif [[ $ip =~ ^(104\.131\.|104\.236\.|134\.122\.|138\.68\.|139\.59\.|159\.65\.|161\.35\.|164\.90\.|165\.227\.|167\.71\.|167\.172\.|178\.62\.|188\.166\.|206\.189\.) ]]; then
+                    provider="DigitalOcean"
+                    org="DigitalOcean LLC"
+                # Akamai
+                elif [[ $ip =~ ^(2\.16\.|23\.0\.|23\.1\.|23\.2\.|23\.3\.|23\.4\.|23\.5\.|23\.6\.|184\.24\.|184\.25\.|184\.26\.) ]]; then
+                    provider="Akamai"
+                    org="Akamai Technologies"
+                # Linode
+                elif [[ $ip =~ ^(45\.33\.|45\.56\.|45\.79\.|50\.116\.|66\.175\.|66\.228\.|69\.164\.|72\.14\.|96\.126\.|139\.144\.|172\.104\.|173\.230\.|173\.255\.|192\.46\.|198\.58\.|212\.71\.) ]]; then
+                    provider="Linode"
+                    org="Linode LLC"
+                # Vultr
+                elif [[ $ip =~ ^(45\.32\.|45\.63\.|45\.76\.|66\.42\.|104\.207\.|108\.61\.|140\.82\.|144\.202\.|149\.28\.|155\.138\.|207\.148\.|207\.246\.) ]]; then
+                    provider="Vultr"
+                    org="Vultr Holdings"
+                # OVH
+                elif [[ $ip =~ ^(5\.196\.|51\.38\.|51\.68\.|51\.75\.|51\.79\.|51\.83\.|51\.89\.|51\.91\.|54\.36\.|54\.37\.|137\.74\.|139\.99\.|141\.94\.|141\.95\.|145\.239\.|146\.59\.|147\.135\.|151\.80\.|152\.228\.|164\.132\.|167\.114\.|178\.32\.|188\.165\.|192\.95\.|198\.27\.|198\.50\.|199\.127\.|213\.32\.|213\.186\.) ]]; then
+                    provider="OVH"
+                    org="OVH SAS"
+                fi
                 
-                # Save to JSON
+                # In full mode, do detailed whois for unknowns
+                if [[ "$MODE" == "full" && "$provider" == "Unknown" ]]; then
+                    local whois_result=$(timeout 2 whois "$ip" 2>/dev/null | grep -i "OrgName\|Organization" | head -1 | cut -d: -f2 | xargs || echo "Unknown")
+                    org="$whois_result"
+                    
+                    # Try to guess provider from org name
+                    case "$org" in
+                        *Amazon*|*AWS*) provider="AWS" ;;
+                        *Google*|*GCP*) provider="Google Cloud" ;;
+                        *Microsoft*|*Azure*) provider="Azure" ;;
+                        *Cloudflare*) provider="Cloudflare" ;;
+                        *DigitalOcean*) provider="DigitalOcean" ;;
+                        *Akamai*) provider="Akamai" ;;
+                    esac
+                fi
+                
                 echo "{\"host\":\"$host\",\"ip\":\"$ip\",\"provider\":\"$provider\",\"org\":\"$org\"}" >> "$IP_DETAILS"
             done
         else
             echo "$host -> NO_IP" >> "$DNS_OUTPUT"
         fi
-        
-    done < "$INPUT"
+    }
+    export -f resolve_batch
+    export DNS_OUTPUT ip_map_tmp IP_DETAILS MODE
     
+    # Run parallel with progress indicator
+    cat "$INPUT" | xargs -I{} -P 20 bash -c 'resolve_batch "{}"' &
+    local pid=$!
+    
+    # Progress indicator
+    while kill -0 $pid 2>/dev/null; do
+        local resolved=$(wc -l < "$DNS_OUTPUT" 2>/dev/null || echo 0)
+        local percent=$(( resolved * 100 / total ))
+        [[ $percent -gt 100 ]] && percent=100
+        printf "\r${CYAN}Resolving: ${WHITE}%d/%d${NC} (${WHITE}%d%%${NC})" "$resolved" "$total" "$percent"
+        sleep 0.3
+    done
+    
+    wait $pid 2>/dev/null || true
     echo ""
     
     # Generate IP grouping report
@@ -341,26 +398,48 @@ resolve_dns() {
         {
             ip=$1
             host=$2
-            hosts[ip] = hosts[ip] (hosts[ip] ? "," : "") host
+            hosts[ip] = hosts[ip] ? hosts[ip] "," host : host
             count[ip]++
         }
         END {
             for (ip in hosts) {
                 print "=== IP: " ip " (" count[ip] " hosts) ==="
                 split(hosts[ip], arr, ",")
-                for (i in arr) {
-                    print "  - " arr[i]
-                }
+                for (i in arr) print "  - " arr[i]
                 print ""
             }
         }
         ' > "$IP_MAP"
     fi
     
-    # Summary
-    local unique_ips=$(grep -o "[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+" "$DNS_OUTPUT" 2>/dev/null | sort -u | wc -l || echo 0)
+    # Generate summary statistics
+    local unique_ips=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$DNS_OUTPUT" 2>/dev/null | sort -u | wc -l || echo 0)
+    
     success "DNS resolution complete"
     info "Unique IPs: ${WHITE}$unique_ips${NC}"
+    
+    # Show cloud provider breakdown
+    if [[ -s "$IP_DETAILS" ]]; then
+        local aws_count=$(grep -c '"provider":"AWS"' "$IP_DETAILS" 2>/dev/null || echo 0)
+        local gcp_count=$(grep -c '"provider":"Google Cloud"' "$IP_DETAILS" 2>/dev/null || echo 0)
+        local azure_count=$(grep -c '"provider":"Azure"' "$IP_DETAILS" 2>/dev/null || echo 0)
+        local cf_count=$(grep -c '"provider":"Cloudflare"' "$IP_DETAILS" 2>/dev/null || echo 0)
+        local do_count=$(grep -c '"provider":"DigitalOcean"' "$IP_DETAILS" 2>/dev/null || echo 0)
+        
+        # Strip any whitespace/newlines from counts
+        aws_count=$(echo "$aws_count" | tr -d '\n\r ')
+        gcp_count=$(echo "$gcp_count" | tr -d '\n\r ')
+        azure_count=$(echo "$azure_count" | tr -d '\n\r ')
+        cf_count=$(echo "$cf_count" | tr -d '\n\r ')
+        do_count=$(echo "$do_count" | tr -d '\n\r ')
+        
+        [[ "$aws_count" -gt 0 ]] 2>/dev/null && info "AWS hosts: ${WHITE}$aws_count${NC}"
+        [[ "$gcp_count" -gt 0 ]] 2>/dev/null && info "Google Cloud hosts: ${WHITE}$gcp_count${NC}"
+        [[ "$azure_count" -gt 0 ]] 2>/dev/null && info "Azure hosts: ${WHITE}$azure_count${NC}"
+        [[ "$cf_count" -gt 0 ]] 2>/dev/null && info "Cloudflare hosts: ${WHITE}$cf_count${NC}"
+        [[ "$do_count" -gt 0 ]] 2>/dev/null && info "DigitalOcean hosts: ${WHITE}$do_count${NC}"
+    fi
+    
     info "Results: dns_resolved.txt, ip_groups.txt, ip_details.json"
 }
 
